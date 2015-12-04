@@ -30,11 +30,15 @@ chrt -f -p 99 PID
 #include <unistd.h>
 #include <sys/time.h>
 #include "Navio/MPU9250.h"
+#include "Navio/LSM9DS1.h"
 #include "AHRS.hpp"
+
+#define G_SI 9.80665
+#define PI   3.14159
 
 // Objects
 
-MPU9250 imu;    // MPU9250
+InertialSensor *imu;    // MPU9250
 AHRS    ahrs;   // Mahony AHRS
 
 // Sensor data
@@ -42,6 +46,7 @@ AHRS    ahrs;   // Mahony AHRS
 float ax, ay, az;
 float gx, gy, gz;
 float mx, my, mz;
+float acc[3], gyro[3], mag[3];
 
 // Orientation data
 
@@ -63,20 +68,45 @@ int sockfd;
 struct sockaddr_in servaddr = {0};
 char sendline[80];
 
+InertialSensor* create_inertial_sensor(char *sensor_name)
+{
+    InertialSensor *imu;
+
+    if (!strcmp(sensor_name, "mpu")) {
+        printf("Selected: MPU9250\n");
+        imu = new MPU9250();
+    }
+    else if (!strcmp(sensor_name, "lsm")) {
+        printf("Selected: LSM9DS1\n");
+        imu = new LSM9DS1();
+    }
+    else {
+        return NULL;
+    }
+
+    return imu;
+}
+
 //============================= Initial setup =================================
 
 void imuSetup()
 {
     //----------------------- MPU initialization ------------------------------
 
-    imu.initialize();
+    imu->initialize();
 
     //-------------------------------------------------------------------------
 
 	printf("Beginning Gyro calibration...\n");
 	for(int i = 0; i<100; i++)
 	{
-		imu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+		imu->update();
+    imu->read_gyroscope(gyro);
+
+    gx = gyro[0] * 180 / PI;
+    gy = gyro[1] * 180 / PI;
+    gz = gyro[2] * 180 / PI;
+
 		offset[0] += (-gx*0.0175);
 		offset[1] += (-gy*0.0175);
 		offset[2] += (-gz*0.0175);
@@ -108,13 +138,23 @@ void imuLoop()
     //-------- Read raw measurements from the MPU and update AHRS --------------
 
     // Accel + gyro.
-    imu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+    imu->update();
+    imu->read_accelerometer(acc);
+    imu->read_gyroscope(gyro);
+
+    ax = acc[0] / G_SI;
+    ay = acc[1] / G_SI;
+    az = acc[2] / G_SI;
+    gx = gyro[0] * 180 / PI;
+    gy = gyro[1] * 180 / PI;
+    gz = gyro[2] * 180 / PI;
+
     ahrs.updateIMU(ax, ay, az, gx*0.0175, gy*0.0175, gz*0.0175, dt);
 
-    // Accel + gyro + mag. 
+    // Accel + gyro + mag.
     // Soft and hard iron calibration required for proper function.
     /*
-    imu.getMotion9(&ax, &ay, &az, &gx, &gy, &gz, &mx, &my, &mz);
+    imu->getMotion9(&ax, &ay, &az, &gx, &gy, &gz, &mx, &my, &mz);
     ahrs.update(ax, ay, az, gx*0.0175, gy*0.0175, gz*0.0175, my, mx, -mz, dt);
     */
 
@@ -151,14 +191,44 @@ void imuLoop()
 
 int main(int argc, char *argv[])
 {
+    int parameter;
+    char *sensor_name;
+
+    if (argc < 2) {
+        printf("Enter parameter\n");
+        return EXIT_FAILURE;
+    }
+
+    // prevent the error message
+    opterr=0;
+
+    while ((parameter = getopt(argc, argv, "i:")) != -1) {
+        switch (parameter) {
+        case 'i': sensor_name = optarg; break;
+        case '?': printf("Wrong parameter. Possible parameters: -i [sensor name]\n");
+                  return EXIT_FAILURE;
+        }
+    }
+
+    imu = create_inertial_sensor(sensor_name);
+
+    if (!imu) {
+        printf("Wrong sensor name. Select: mpu or lsm\n");
+        return EXIT_FAILURE;
+    }
+
+    if (!imu->probe()) {
+        printf("Sensor not enable\n");
+        return EXIT_FAILURE;
+    }
     //--------------------------- Network setup -------------------------------
 
     sockfd = socket(AF_INET,SOCK_DGRAM,0);
     servaddr.sin_family = AF_INET;
 
-    if (argc == 3)  {
-        servaddr.sin_addr.s_addr = inet_addr(argv[1]);
-        servaddr.sin_port = htons(atoi(argv[2]));
+    if (argc == 5)  {
+        servaddr.sin_addr.s_addr = inet_addr(argv[3]);
+        servaddr.sin_port = htons(atoi(argv[4]));
     } else {
         servaddr.sin_addr.s_addr = inet_addr("127.0.0.1");
         servaddr.sin_port = htons(7000);
